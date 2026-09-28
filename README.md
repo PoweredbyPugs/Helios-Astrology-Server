@@ -1,4 +1,4 @@
-# Astrology Server
+# Helios Astrology Server
 
 A Swiss Ephemeris-based astrology REST API providing natal chart calculations, essential dignities, timing techniques, planetary positions, transits, midpoints, eclipses, dashas, and planetary cycle timelines. Used as the backend by the [Obsidian Moon](https://github.com/PoweredbyPugs/moon-phase) plugin and the [Stella MCP server](https://github.com/PoweredbyPugs/Stella-Astrological-System).
 
