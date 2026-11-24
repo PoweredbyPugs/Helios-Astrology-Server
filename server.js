@@ -945,214 +945,125 @@ app.get("/planets-now", (req, res) => {
   }
 });
 
-// Improved /weekly-major-phase endpoint using the same ephemeris approach
+// ----------------------------------------------------------------------------
+// Exact major lunar phases (New / First Quarter / Full / Last Quarter)
+// ----------------------------------------------------------------------------
+// Shared by /daily-moon-phase and /weekly-major-phase. Times are found in UTC
+// and reported in PHASE_TZ, which is also the zone that decides which day/week
+// a phase belongs to.
+
+const PHASE_TZ = "America/New_York";
+const MAJOR_PHASES = [
+  { name: "New Moon", angle: 0, emoji: "🌑" },
+  { name: "First Quarter", angle: 90, emoji: "🌓" },
+  { name: "Full Moon", angle: 180, emoji: "🌕" },
+  { name: "Last Quarter", angle: 270, emoji: "🌗" }
+];
+const PHASE_SIGNS = [
+  "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
+  "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"
+];
+
+// Unrounded Sun/Moon longitudes at a UTC instant (ms). Uses calc_ut so the
+// UT Julian day isn't misread as Terrestrial Time (~69 s error).
+function sunMoonAt(ms) {
+  const t = moment.utc(ms);
+  const hour = t.hour() + t.minute() / 60 + (t.second() + t.millisecond() / 1000) / 3600;
+  const jd = sweph.julday(t.year(), t.month() + 1, t.date(), hour, sweph.constants.SE_GREG_CAL);
+  const flags = sweph.constants.SEFLG_SWIEPH;
+  const moon = sweph.calc_ut(jd, sweph.constants.SE_MOON, flags);
+  const sun = sweph.calc_ut(jd, sweph.constants.SE_SUN, flags);
+  if (!moon || (moon.flag !== 0 && moon.flag !== 2)) throw new Error(moon?.error || "Moon calc error");
+  if (!sun || (sun.flag !== 0 && sun.flag !== 2)) throw new Error(sun?.error || "Sun calc error");
+  const moonLon = moon.data[0];
+  const elongation = (((moonLon - sun.data[0]) % 360) + 360) % 360;
+  return { moonLon, elongation };
+}
+
+// Signed distance from a target elongation, in (-180, 180]
+function phaseOffset(elongation, target) {
+  let d = (elongation - target) % 360;
+  if (d > 180) d -= 360;
+  if (d <= -180) d += 360;
+  return d;
+}
+
+// Every major phase whose exact moment falls in [start, end). Samples hourly
+// (elongation moves ~0.5°/h, so nothing can slip between samples) and bisects
+// each crossing to the second. Window edges are inclusive of the final hour,
+// so a phase at 23:xx is never lost between two days.
+function findMajorPhases(start, end) {
+  const startMs = moment(start).valueOf();
+  const endMs = moment(end).valueOf();
+  const found = [];
+  let t0 = startMs;
+  let e0 = sunMoonAt(t0).elongation;
+  while (t0 < endMs) {
+    const t1 = Math.min(t0 + 3600000, endMs);
+    const e1 = sunMoonAt(t1).elongation;
+    for (const p of MAJOR_PHASES) {
+      if (!(phaseOffset(e0, p.angle) < 0 && phaseOffset(e1, p.angle) >= 0)) continue;
+      let lo = t0, hi = t1;
+      while (hi - lo > 500) {
+        const mid = (lo + hi) / 2;
+        if (phaseOffset(sunMoonAt(mid).elongation, p.angle) >= 0) hi = mid; else lo = mid;
+      }
+      if (hi >= endMs) continue; // belongs to the next window
+      const exact = moment.utc(Math.round(hi / 1000) * 1000);
+      const { moonLon } = sunMoonAt(exact.valueOf());
+      found.push({
+        date: moment(exact).tz(PHASE_TZ).format("YYYY-MM-DD HH:mm:ss"),
+        utc: exact.toISOString(),
+        timezone: PHASE_TZ,
+        moonPhase: p.name,
+        moonSign: PHASE_SIGNS[Math.floor(moonLon / 30) % 12],
+        degreeInSign: (moonLon % 30).toFixed(2),
+        emoji: p.emoji
+      });
+    }
+    t0 = t1;
+    e0 = e1;
+  }
+  return found.sort((a, b) => a.utc.localeCompare(b.utc));
+}
+
+// GET /weekly-major-phase[?date=YYYY-MM-DD]
+// Major phase(s) in the Monday–Sunday week (PHASE_TZ) containing `date`
+// (default: today). Top-level fields describe the first phase of the week.
+// If the week has none, they describe the next phase after it, with
+// inWeek: false — never an estimate.
 app.get("/weekly-major-phase", (req, res) => {
   try {
-    console.log("Finding accurate major moon phase for the week using ephemeris");
-    
-    // Get current time
-    const now = moment.tz("America/New_York");
-    
-    // Define current week boundaries (Monday to Sunday)
-    const currentDay = now.day(); // 0 is Sunday, 1 is Monday, etc.
-    const daysToMonday = currentDay === 0 ? 6 : currentDay - 1; // Days back to Monday
-    const mondayDate = moment(now).subtract(daysToMonday, 'days').startOf('day');
-    const sundayDate = moment(mondayDate).add(6, 'days').endOf('day');
-    
-    console.log(`Week range: ${mondayDate.format('YYYY-MM-DD')} to ${sundayDate.format('YYYY-MM-DD')}`);
-    
-    // Get current moon phase info - using the accurate existing method
-    const currentPhaseInfo = getMoonPhaseForDate(now);
-    console.log(`Current moon: ${currentPhaseInfo.moonPhase} in ${currentPhaseInfo.moonSign} (${currentPhaseInfo.phaseAngle}°)`);
-    
-    // Check if we're currently in a major phase
-    if (isMajorPhase(currentPhaseInfo.moonPhase)) {
-      console.log(`Currently in a major phase: ${currentPhaseInfo.moonPhase}`);
-      return res.json({
-        date: now.format('YYYY-MM-DD HH:mm:ss'),
-        moonPhase: currentPhaseInfo.moonPhase,
-        moonSign: currentPhaseInfo.moonSign
-      });
+    const ref = req.query.date
+      ? moment.tz(req.query.date, "YYYY-MM-DD", true, PHASE_TZ)
+      : moment.tz(PHASE_TZ);
+    if (!ref.isValid()) {
+      return res.status(400).json({ error: "date must be YYYY-MM-DD" });
     }
-    
-    // Find all major phases in the current week
-    const phasesToCheck = [
-      { phase: "New Moon", targetAngle: 0 },
-      { phase: "First Quarter", targetAngle: 90 },
-      { phase: "Full Moon", targetAngle: 180 },
-      { phase: "Last Quarter", targetAngle: 270 }
-    ];
-    
-    // We'll check every 6 hours throughout the week for phase changes
-    // This gives us enough granularity to detect major phases
-    let majorPhasesInWeek = [];
-    let datePointer = moment(mondayDate);
-    
-    // Analysis data for determining closest major phase if none found
-    const angleData = [];
-    
-    while (datePointer.isSameOrBefore(sundayDate)) {
-      const phaseInfo = getMoonPhaseForDate(datePointer);
-      const phaseAngle = parseFloat(phaseInfo.phaseAngle);
-      
-      // Store phase angle for analysis
-      angleData.push({
-        date: datePointer.format('YYYY-MM-DD HH:mm'),
-        angle: phaseAngle,
-        moonSign: phaseInfo.moonSign
-      });
-      
-      // Check if we're at or very near a major phase
-      for (const phaseCheck of phasesToCheck) {
-        // Check if we're within 3 degrees of the target angle
-        // Also handle the case of New Moon (0/360 degrees)
-        let angleDistance;
-        if (phaseCheck.targetAngle === 0) {
-          angleDistance = Math.min(phaseAngle, 360 - phaseAngle);
-        } else {
-          angleDistance = Math.abs(phaseAngle - phaseCheck.targetAngle);
-        }
-        
-        if (angleDistance <= 3) { // Within 3 degrees of major phase
-          console.log(`Found ${phaseCheck.phase} at ${datePointer.format('YYYY-MM-DD HH:mm')} (angle: ${phaseAngle.toFixed(2)}°)`);
-          
-          majorPhasesInWeek.push({
-            date: datePointer.format('YYYY-MM-DD HH:mm:ss'),
-            moonPhase: phaseCheck.phase,
-            moonSign: phaseInfo.moonSign,
-            distance: angleDistance
-          });
-        }
-      }
-      
-      // Move to next 6-hour increment
-      datePointer.add(6, 'hours');
+    const weekStart = moment(ref).isoWeekday(1).startOf("day");
+    const weekEnd = moment(weekStart).add(7, "days");
+    const phases = findMajorPhases(weekStart, weekEnd);
+
+    const week = {
+      weekStart: weekStart.format("YYYY-MM-DD"),
+      weekEnd: moment(weekEnd).subtract(1, "day").format("YYYY-MM-DD")
+    };
+    if (phases.length > 0) {
+      return res.json({ ...phases[0], inWeek: true, ...week, phases });
     }
-    
-    console.log(`Found ${majorPhasesInWeek.length} major phases in the week`);
-    
-    // If we found major phases, return the best one
-    if (majorPhasesInWeek.length > 0) {
-      // First, sort by distance to exact phase
-      majorPhasesInWeek.sort((a, b) => a.distance - b.distance);
-      
-      // Get the most exact phase
-      const exactPhase = majorPhasesInWeek[0];
-      console.log(`Returning exact major phase: ${exactPhase.moonPhase} in ${exactPhase.moonSign}`);
-      
-      return res.json({
-        date: exactPhase.date,
-        moonPhase: exactPhase.moonPhase,
-        moonSign: exactPhase.moonSign
-      });
-    }
-    
-    // If no exact major phases in the week, find the closest upcoming major phase
-    // This approach determines which major phase we're currently progressing toward
-    console.log("No exact major phases this week, finding closest upcoming phase");
-    
-    // Determine the phase we're progressing toward
-    // The moon moves ~12 degrees per day, so we need to find which major phase
-    // is coming up next based on the current phase angle
-    
-    // We've been storing phase angles throughout the week
-    // Sort by time to get the most recent angle
-    angleData.sort((a, b) => moment(b.date).valueOf() - moment(a.date).valueOf());
-    
-    // Get the most recent angle data
-    const latestAngle = angleData[0].angle;
-    const latestSign = angleData[0].moonSign;
-    const latestDate = angleData[0].date;
-    
-    console.log(`Latest angle: ${latestAngle.toFixed(2)}° in ${latestSign} at ${latestDate}`);
-    
-    // Determine which major phase is coming next
-    let nextMajorPhase, nextAngle;
-    if (latestAngle < 90) {
-      nextMajorPhase = "First Quarter";
-      nextAngle = 90;
-    } else if (latestAngle < 180) {
-      nextMajorPhase = "Full Moon";
-      nextAngle = 180;
-    } else if (latestAngle < 270) {
-      nextMajorPhase = "Last Quarter";
-      nextAngle = 270;
-    } else {
-      nextMajorPhase = "New Moon";
-      nextAngle = 360; // Will be treated as 0 in the phase calculation
-    }
-    
-    // Estimate when this phase will occur and in what sign
-    // The moon moves about 12-13 degrees per day through the zodiac
-    // and the phase angle changes at roughly the same rate
-    
-    // Calculate days until the next major phase
-    const degreesToNext = nextAngle - latestAngle;
-    const daysToNext = degreesToNext / 12.2; // Approx degrees per day
-    
-    // Calculate the date of the next major phase
-    const nextPhaseDate = moment(latestDate).add(daysToNext, 'days');
-    
-    // For the sign, we need to estimate how many signs the moon will move through
-    // Each sign is 30 degrees, and the moon moves ~12 degrees per day
-    
-    // Calculate the sign at the next major phase
-    const signNames = [
-      "Aries", "Taurus", "Gemini", "Cancer",
-      "Leo", "Virgo", "Libra", "Scorpio",
-      "Sagittarius", "Capricorn", "Aquarius", "Pisces"
-    ];
-    
-    let signIndex = signNames.indexOf(latestSign);
-    const daysPerSign = 30 / 12.2; // Approx days to move through one sign
-    const signsToMove = Math.floor(daysToNext / daysPerSign);
-    
-    // Calculate new sign index
-    signIndex = (signIndex + signsToMove) % 12;
-    const nextPhaseSign = signNames[signIndex];
-    
-    console.log(`Next major phase: ${nextMajorPhase} estimated at ${nextPhaseDate.format('YYYY-MM-DD HH:mm')} in ${nextPhaseSign}`);
-    
-    // Return the next major phase information
+
+    // Major phases are at most ~8.1 days apart, so 9 days always finds one
+    const next = findMajorPhases(weekEnd, moment(weekEnd).add(9, "days"))[0];
     return res.json({
-      date: nextPhaseDate.format('YYYY-MM-DD HH:mm:ss'),
-      moonPhase: nextMajorPhase,
-      moonSign: nextPhaseSign
+      ...next,
+      inWeek: false,
+      note: "No major phase this week; this is the next one.",
+      ...week,
+      phases: []
     });
-    
   } catch (error) {
     console.error("Error finding weekly major phase:", error);
-    
-    // Fallback to a safe response based on current phase
-    try {
-      const now = moment.tz("America/New_York");
-      const currentPhase = getMoonPhaseForDate(now);
-      
-      // Convert the current phase to the nearest major phase
-      const phaseAngle = parseFloat(currentPhase.phaseAngle);
-      let majorPhase;
-      
-      if (phaseAngle < 45 || phaseAngle >= 315) {
-        majorPhase = "New Moon";
-      } else if (phaseAngle >= 45 && phaseAngle < 135) {
-        majorPhase = "First Quarter";
-      } else if (phaseAngle >= 135 && phaseAngle < 225) {
-        majorPhase = "Full Moon";
-      } else {
-        majorPhase = "Last Quarter";
-      }
-      
-      return res.json({
-        date: now.format('YYYY-MM-DD HH:mm:ss'),
-        moonPhase: majorPhase,
-        moonSign: currentPhase.moonSign
-      });
-    } catch (e) {
-      console.error("Fallback error:", e);
-      return res.json({
-        error: "Could not determine moon phase"
-      });
-    }
+    return res.status(500).json({ error: "Failed to calculate weekly major phase" });
   }
 });
 
@@ -3228,102 +3139,34 @@ app.get("/important-transits", (req, res) => {
 });
 
 // Daily moon phase endpoint - returns major phase if one perfects on the given date
+// GET /daily-moon-phase[?date=YYYY-MM-DD]
+// Whether a major phase perfects on that calendar day in PHASE_TZ (the full
+// 00:00–24:00, including DST days of 23 or 25 hours).
 app.get("/daily-moon-phase", (req, res) => {
   try {
-    const dateParam = req.query.date;
-    const targetDate = dateParam
-      ? moment.tz(dateParam, "America/New_York").startOf('day')
-      : moment.tz("America/New_York").startOf('day');
+    const dayStart = req.query.date
+      ? moment.tz(req.query.date, "YYYY-MM-DD", true, PHASE_TZ)
+      : moment.tz(PHASE_TZ).startOf("day");
+    if (!dayStart.isValid()) {
+      return res.status(400).json({ error: "date must be YYYY-MM-DD" });
+    }
+    const dayEnd = moment(dayStart).add(1, "day");
+    const phases = findMajorPhases(dayStart, dayEnd);
 
-    console.log(`Checking for major moon phase on: ${targetDate.format('YYYY-MM-DD')}`);
-
-    const dayEnd = moment(targetDate).endOf('day');
-
-    const majorPhases = [
-      { name: "New Moon", targetAngle: 0, emoji: "🌑" },
-      { name: "First Quarter", targetAngle: 90, emoji: "🌓" },
-      { name: "Full Moon", targetAngle: 180, emoji: "🌕" },
-      { name: "Last Quarter", targetAngle: 270, emoji: "🌗" }
-    ];
-
-    let foundPhase = null;
-    let datePointer = moment(targetDate);
-    let prevAngle = null;
-
-    while (datePointer.isSameOrBefore(dayEnd) && !foundPhase) {
-      const phaseInfo = getMoonPhaseForDate(datePointer);
-      const currentAngle = parseFloat(phaseInfo.phaseAngle);
-
-      if (prevAngle !== null) {
-        for (const phase of majorPhases) {
-          let crossed = false;
-
-          if (phase.targetAngle === 0) {
-            crossed = (prevAngle > 350 && currentAngle < 10);
-          } else {
-            crossed = (prevAngle < phase.targetAngle && currentAngle >= phase.targetAngle);
-          }
-
-          if (crossed) {
-            let searchStart = moment(datePointer).subtract(1, 'hour');
-            let searchEnd = moment(datePointer);
-
-            for (let i = 0; i < 8; i++) {
-              const midPoint = moment(searchStart).add(
-                moment.duration(searchEnd.diff(searchStart)).asMilliseconds() / 2, 'milliseconds'
-              );
-              const midPhase = getMoonPhaseForDate(midPoint);
-              const midAngle = parseFloat(midPhase.phaseAngle);
-
-              let pastTarget;
-              if (phase.targetAngle === 0) {
-                pastTarget = midAngle < 180;
-              } else {
-                pastTarget = midAngle >= phase.targetAngle;
-              }
-
-              if (pastTarget) {
-                searchEnd = midPoint;
-              } else {
-                searchStart = midPoint;
-              }
-            }
-
-            const exactPhaseInfo = getMoonPhaseForDate(searchEnd);
-
-            foundPhase = {
-              date: searchEnd.format('YYYY-MM-DD HH:mm:ss'),
-              moonPhase: phase.name,
-              moonSign: exactPhaseInfo.moonSign,
-              degreeInSign: exactPhaseInfo.degreeInSign,
-              emoji: phase.emoji
-            };
-            break;
-          }
-        }
-      }
-
-      prevAngle = currentAngle;
-      datePointer.add(1, 'hour');
+    if (phases.length > 0) {
+      console.log(`Found ${phases[0].moonPhase} in ${phases[0].moonSign} at ${phases[0].date}`);
+      return res.json({ hasMajorPhase: true, ...phases[0] });
     }
 
-    if (foundPhase) {
-      console.log(`Found ${foundPhase.moonPhase} in ${foundPhase.moonSign} at ${foundPhase.date}`);
-      return res.json({
-        hasMajorPhase: true,
-        ...foundPhase
-      });
-    } else {
-      const currentPhase = getMoonPhaseForDate(moment.tz("America/New_York"));
-      console.log(`No major phase on ${targetDate.format('YYYY-MM-DD')}`);
-      return res.json({
-        hasMajorPhase: false,
-        moonPhase: null,
-        moonSign: currentPhase.moonSign,
-        emoji: null
-      });
-    }
-
+    // Moon sign at local noon of the requested day
+    const noon = moment(dayStart).add(12, "hours").valueOf();
+    const { moonLon } = sunMoonAt(noon);
+    return res.json({
+      hasMajorPhase: false,
+      moonPhase: null,
+      moonSign: PHASE_SIGNS[Math.floor(moonLon / 30) % 12],
+      emoji: null
+    });
   } catch (error) {
     console.error("Error calculating daily moon phase:", error);
     return res.status(500).json({
