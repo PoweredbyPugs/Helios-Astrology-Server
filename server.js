@@ -1179,20 +1179,27 @@ function isMajorPhase(phaseName) {
   return ["New Moon", "Full Moon", "First Quarter", "Last Quarter"].includes(phaseName);
 }
 
+// Daily motion in longitude (degrees per day). Swiss Ephemeris only fills the
+// speed fields when SEFLG_SPEED is requested; without it data[3] is always 0.
+function lonSpeed(planetId, julianDay) {
+  const result = sweph.calc(
+    julianDay,
+    planetId,
+    sweph.constants.SEFLG_SWIEPH | sweph.constants.SEFLG_SPEED
+  );
+  if (!result || !result.data || result.flag < 0) {
+    return 0; // Default to stationary/direct if calculation fails
+  }
+  return result.data[3];
+}
+
 // Helper function to accurately determine if a planet is retrograde using ephemeris data
-function isRetrograde(planetId, julianDay, flags) {
+function isRetrograde(planetId, julianDay) {
   if (planetId === sweph.constants.SE_SUN || planetId === sweph.constants.SE_MOON) {
     return false; // Sun and Moon never go retrograde
   }
-
-  const result = sweph.calc(julianDay, planetId, flags);
-  if (!result || (result.flag !== 0 && result.flag !== 2)) {
-    return false; // Default to direct if calculation fails
-  }
-
-  // result.data[3] is the daily motion in longitude (degrees per day)
-  // Negative values indicate retrograde motion
-  return result.data[3] < 0;
+  // Negative daily motion indicates retrograde motion
+  return lonSpeed(planetId, julianDay) < 0;
 }
 
 // Add a simple test endpoint to verify server is running
@@ -1584,7 +1591,7 @@ app.get("/planetary-retrogrades", (req, res) => {
 
       // Get position and speed data
       const longitude = result.data[0]; // ecliptic longitude
-      const speed = result.data[3]; // daily motion rate in degrees per day
+      const speed = lonSpeed(planet.id, jd); // daily motion rate in degrees per day
 
       // Calculate sign and degree
       const signIndex = Math.floor((longitude % 360) / 30);
@@ -1634,7 +1641,7 @@ app.get("/planetary-retrogrades", (req, res) => {
             continue;
           }
 
-          const speed = result.data[3];
+          const speed = lonSpeed(planet.id, jdCheck);
           const longitude = result.data[0];
           const isRetrograde = speed < 0;
 
@@ -2845,7 +2852,7 @@ app.get("/planetary-stations", (req, res) => {
         
         // Get speed and position info
         const longitude = result.data[0];
-        const speed = result.data[3]; // Daily motion rate
+        const speed = lonSpeed(planet.id, jd); // Daily motion rate
         const signIndex = Math.floor((longitude % 360) / 30);
         const sign = signNames[signIndex];
         const degreeInSign = (longitude % 30).toFixed(2);
@@ -3343,7 +3350,7 @@ app.post("/generate-chart", (req, res) => {
     const planets = planetDefs.map(planet => {
       const result = sweph.calc(jd, planet.id, flags);
       const lon = result.data[0];
-      const speed = result.data[3];
+      const speed = lonSpeed(planet.id, jd);
       const sign = getSignFromLongitude(lon);
       const degreeInSign = getDegreeInSign(lon);
       
@@ -4033,7 +4040,7 @@ app.get("/transits/:name/summary", (req, res) => {
       const result = sweph.calc(jd, tp.id, flags);
       const transitLon = result.data[0];
       const transitSign = getSignFromLongitude(transitLon);
-      const isRetrograde = result.data[3] < 0;
+      const isRetrograde = lonSpeed(tp.id, jd) < 0;
       
       for (const natal of chart.planets) {
         const natalLon = parseFloat(natal.longitude);
